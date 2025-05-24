@@ -213,8 +213,6 @@ def main():
 
     # Process each location independently
     for location, code in REGION_CODES.items():
-        print(f"\nProcessing {location}...")
-
         # Initialize data structures for this location
         location_data = {}
         location_sample_sizes = {}
@@ -230,18 +228,18 @@ def main():
             time.sleep(3)
 
         # Create plot for this location if data was found
-        if location_data:
-            color = colors.get(location, 'skyblue')
-            filename = create_plot(location, location_data, location_sample_sizes, color)
-
-            # Print data summary for this location
-            print(f"\n{location} data summary:")
-            for beds, price in location_data.items():
-                sample_count = location_sample_sizes.get(beds, "N/A")
-                print(f"  {beds}: £{price:,.2f} (Sample size: {sample_count})")
-            print(f"Plot saved to: {filename}")
-        else:
-            print(f"No data found for {location}")
+        # if location_data:
+        #     color = colors.get(location, 'skyblue')
+        #     filename = create_plot(location, location_data, location_sample_sizes, color)
+        #
+        #     # Print data summary for this location
+        #     print(f"\n{location} data summary:")
+        #     for beds, price in location_data.items():
+        #         sample_count = location_sample_sizes.get(beds, "N/A")
+        #         print(f"  {beds}: £{price:,.2f} (Sample size: {sample_count})")
+        #     print(f"Plot saved to: {filename}")
+        # else:
+        #     print(f"No data found for {location}")
 
 
 if __name__ == "__main__":
