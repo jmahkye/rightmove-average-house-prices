@@ -2,10 +2,11 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import matplotlib.pyplot as plt
-import numpy as np
 from statistics import mean
 import time
 import os
+import csv
+from datetime import datetime, timezone
 
 # Define region codes for each location
 REGION_CODES = {
@@ -21,6 +22,53 @@ REGION_CODES = {
     'Islington': 'REGION^87515',
     'Plymouth': 'REGION^1073'
 }
+
+
+def extract_prices_new_structure(soup):
+    """Extract prices using the new Rightmove HTML structure"""
+    prices = []
+
+    # Method 1: Direct price class (most specific)
+    price_elements = soup.find_all('div', class_='PropertyPrice_price__VL65t')
+
+    if price_elements:
+        for element in price_elements:
+            price_text = element.text.strip()
+
+            # Extract numeric value
+            price_match = re.search(r'£([\d,]+)', price_text)
+            if price_match:
+                price = int(price_match.group(1).replace(',', ''))
+                prices.append(price)
+
+    # Method 2: Using data-testid (more stable for future changes)
+    if not prices:
+        print("Trying data-testid approach...")
+        price_links = soup.find_all(attrs={'data-testid': 'property-price'})
+
+        for link in price_links:
+            # Look for price div within this link
+            price_div = link.find('div', class_=re.compile(r'PropertyPrice_price__'))
+            if price_div:
+                price_text = price_div.text.strip()
+                price_match = re.search(r'£([\d,]+)', price_text)
+                if price_match:
+                    price = int(price_match.group(1).replace(',', ''))
+                    prices.append(price)
+
+    # Method 3: Broader search for any PropertyPrice_price class (in case suffix changes)
+    if not prices:
+        print("Trying broader PropertyPrice_price search...")
+        price_elements = soup.find_all('div', class_=re.compile(r'PropertyPrice_price__'))
+
+        for element in price_elements:
+            price_text = element.text.strip()
+            price_match = re.search(r'£([\d,]+)', price_text)
+            if price_match:
+                price = int(price_match.group(1).replace(',', ''))
+                prices.append(price)
+
+    return prices
 
 
 def get_avg_price(bedroom_count, location_code, max_pages=5):
@@ -84,47 +132,26 @@ def get_avg_price(bedroom_count, location_code, max_pages=5):
         if page == 0:
             print(f"Successfully retrieved: {response.url}")
 
-        # Parse the HTML content
-        soup = BeautifulSoup(response.text, 'html.parser')
+            # Parse the HTML content
+            soup = BeautifulSoup(response.text, 'html.parser')
 
-        # Find all price elements - Rightmove uses this class for prices
-        price_elements = soup.find_all('div', class_='propertyCard-priceValue')
+            page_prices = extract_prices_new_structure(soup)
 
-        if not price_elements:
-            # If we didn't find prices with the expected class, try alternative
-            price_elements = soup.find_all('span', attrs={'data-test': 'property-price'})
-
-        # If still no prices found and it's not the first page, we might have reached the end
-        if not price_elements and page > 0:
-            print(f"No more properties found after page {page}.")
-            break
-
-        # Extract prices
-        page_prices = []
-        for element in price_elements:
-            price_text = element.text.strip()
-            # Extract numeric value using regex
-            price_match = re.search(r'£([\d,]+)', price_text)
-            if price_match:
-                # Convert to number
-                price = int(price_match.group(1).replace(',', ''))
-                page_prices.append(price)
-
-        # If no prices found on this page
-        if not page_prices:
-            if page == 0:
+            # If no prices found and it's not the first page, we might have reached the end
+            if not page_prices and page > 0:
+                print(f"No more properties found after page {page}.")
+                break
+            elif not page_prices and page == 0:
                 print(f"No prices found for {location_name} with {bedroom_count} bedrooms.")
-            else:
-                print(f"No more prices found after page {page}.")
-            break
+                break
 
-        # Add this page's prices to the total
-        all_prices.extend(page_prices)
-        print(f"Page {page + 1}: Found {len(page_prices)} properties. Total so far: {len(all_prices)}")
+            # Add this page's prices to the total
+            all_prices.extend(page_prices)
+            print(f"Page {page + 1}: Found {len(page_prices)} properties. Total so far: {len(all_prices)}")
 
-        # Add a delay between page requests
-        if page < max_pages - 1:
-            time.sleep(1)
+            # Add a delay between page requests
+            if page < max_pages - 1:
+                time.sleep(1)
 
     # Calculate average if prices were found
     if all_prices:
@@ -204,42 +231,49 @@ def create_plot(location, prices_data, sample_sizes, color='skyblue'):
 
 
 def main():
-    # Define location colors
-    colors = {
-        'Greater Manchester': 'skyblue',
-        'South London': 'lightcoral',
-        'Tyne and Wear': 'lightgreen'
-    }
+    # CSV setup
+    csv_filename = 'uk_daily_house_prices.csv'
+    csv_headers = ['Location', 'Rooms', 'Timestamp(unix)', 'Timestamp(UTC)', 'Average_Price', 'Sample_Size', 'Source']
 
-    # Process each location independently
-    for location, code in REGION_CODES.items():
-        # Initialize data structures for this location
-        location_data = {}
-        location_sample_sizes = {}
+    # Create CSV file if it doesn't exist
+    if not os.path.exists(csv_filename):
+        with open(csv_filename, 'w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(csv_headers)
+        print(f"Created CSV file: {csv_filename}")
 
-        # Scrape for 1, 2, and 3 bedroom properties
-        for bedrooms in [1, 2, 3]:
-            avg_price, count = get_avg_price(bedrooms, code, max_pages=10)
-            if avg_price:
-                bed_key = f"{bedrooms} Bed"
-                location_data[bed_key] = avg_price
-                location_sample_sizes[bed_key] = count
-            # Add a delay to avoid overwhelming the server
-            time.sleep(3)
+    while True:
+        # Get current timestamp
+        timestamp = datetime.now(timezone.utc)
+        unix_timestamp = int(timestamp.timestamp())
+        utc_timestamp = timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')
 
-        # Create plot for this location if data was found
-        # if location_data:
-        #     color = colors.get(location, 'skyblue')
-        #     filename = create_plot(location, location_data, location_sample_sizes, color)
-        #
-        #     # Print data summary for this location
-        #     print(f"\n{location} data summary:")
-        #     for beds, price in location_data.items():
-        #         sample_count = location_sample_sizes.get(beds, "N/A")
-        #         print(f"  {beds}: £{price:,.2f} (Sample size: {sample_count})")
-        #     print(f"Plot saved to: {filename}")
-        # else:
-        #     print(f"No data found for {location}")
+        print(f"\nStarting data collection at {utc_timestamp}")
+
+        # Process each location independently
+        for location, code in REGION_CODES.items():
+            print(f"\nProcessing {location}...")
+
+            # Scrape for 1, 2, and 3 bedroom properties
+            for bedrooms in [1, 2, 3]:
+                avg_price, count = get_avg_price(bedrooms, code, max_pages=10)
+
+                if avg_price:
+                    # Write to CSV
+                    with open(csv_filename, 'a', newline='') as file:
+                        writer = csv.writer(file)
+                        writer.writerow(
+                            [location, bedrooms, unix_timestamp, utc_timestamp, avg_price, count, 'Rightmove'])
+
+                    print(f"Logged: {location}, {bedrooms} bedrooms, £{avg_price:,.2f} (n={count}) [Rightmove]")
+                else:
+                    print(f"No data found for {location} with {bedrooms} bedrooms")
+
+                # Add a delay to avoid overwhelming the server
+                time.sleep(3)
+
+        print(f"\nData collection complete. Sleeping for 24 hours...")
+        time.sleep(60 * 60)  # Wait 24 hours
 
 
 if __name__ == "__main__":
