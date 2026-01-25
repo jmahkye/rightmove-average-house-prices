@@ -12,7 +12,7 @@ import logging
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -30,6 +30,46 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+def parse_listing_age(date_listed: Optional[str]) -> Optional[float]:
+    """
+    Parse the date_listed field and return age in days
+
+    Args:
+        date_listed: Text like "Added today", "Added yesterday", "Reduced on 15/01/2026"
+
+    Returns:
+        Age in days (float), or None if unable to parse
+    """
+    if not date_listed:
+        return None
+
+    date_listed = date_listed.lower().strip()
+
+    # "Added today" or "Reduced today"
+    if 'today' in date_listed:
+        return 0.0
+
+    # "Added yesterday" or "Reduced yesterday"
+    if 'yesterday' in date_listed:
+        return 1.0
+
+    # "Added on DD/MM/YYYY" or "Reduced on DD/MM/YYYY"
+    date_match = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})', date_listed)
+    if date_match:
+        try:
+            day, month, year = int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3))
+            listing_date = datetime(year, month, day)
+            age = (datetime.now() - listing_date).days
+            return float(age)
+        except ValueError:
+            logger.warning(f"Could not parse date from: {date_listed}")
+            return None
+
+    # If we can't parse, return None (we'll be conservative and include it)
+    logger.debug(f"Unknown date format: {date_listed}")
+    return None
 
 
 class RightmoveScraper:
@@ -253,13 +293,49 @@ class RightmoveScraper:
         return properties
 
 
-def save_to_csv(properties: List[Dict], output_file: Path) -> None:
+def filter_recent_listings(properties: List[Dict], max_age_days: Optional[float] = None) -> List[Dict]:
+    """
+    Filter properties to only include recent listings
+
+    Args:
+        properties: List of property dictionaries
+        max_age_days: Maximum age in days (None = no filtering)
+
+    Returns:
+        Filtered list of properties
+    """
+    if max_age_days is None:
+        logger.info("No recency filter applied")
+        return properties
+
+    logger.info(f"Filtering listings posted within last {max_age_days} day(s)...")
+
+    filtered = []
+    for prop in properties:
+        age = parse_listing_age(prop.get('date_listed'))
+
+        if age is None:
+            # If we can't parse the date, be conservative and include it
+            logger.debug(f"Unknown age for property {prop.get('property_id')}, including it")
+            filtered.append(prop)
+        elif age <= max_age_days:
+            logger.debug(f"Including property {prop.get('property_id')}, age: {age} days")
+            filtered.append(prop)
+        else:
+            logger.debug(f"Excluding property {prop.get('property_id')}, age: {age} days")
+
+    logger.info(f"Filtered from {len(properties)} to {len(filtered)} properties")
+    return filtered
+
+
+def save_to_csv(properties: List[Dict], output_file: Path, append: bool = False) -> None:
     """
     Save properties to CSV file
 
     Args:
         properties: List of property dictionaries
         output_file: Path to output CSV file
+        append: If True, append to existing file; if False, overwrite
     """
     if not properties:
         logger.warning("No properties to save")
@@ -271,12 +347,21 @@ def save_to_csv(properties: List[Dict], output_file: Path) -> None:
     ]
 
     try:
-        with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        # Check if file exists and if we should write header
+        file_exists = output_file.exists()
+        mode = 'a' if append else 'w'
+
+        with open(output_file, mode, newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
-            writer.writeheader()
+
+            # Write header only if file is new or we're overwriting
+            if not append or not file_exists:
+                writer.writeheader()
+
             writer.writerows(properties)
 
-        logger.info(f"Successfully saved {len(properties)} properties to {output_file}")
+        action = "appended" if append and file_exists else "saved"
+        logger.info(f"Successfully {action} {len(properties)} properties to {output_file}")
     except IOError as e:
         logger.error(f"Failed to write CSV file: {e}")
         sys.exit(1)
@@ -301,11 +386,14 @@ Examples:
   # Use custom delay (in seconds)
   %(prog)s "https://..." --delay 3.0
 
-  # Run in scheduled mode (daily at 9am)
-  %(prog)s "https://..." --schedule --run-time 09:00 --max-pages 10 --fetch-details
+  # Daily scrape: only include listings posted within 1 day, append to file
+  %(prog)s "https://..." -o daily_listings.csv --max-age 1.0 --append
+
+  # Run in scheduled mode (daily at 9am) with recency filter
+  %(prog)s "https://..." --schedule --run-time 09:00 --max-pages 10 --max-age 1.0 --append
 
   # Run scheduler and execute immediately
-  %(prog)s "https://..." --schedule --run-time 14:30 --run-now --fetch-details
+  %(prog)s "https://..." --schedule --run-time 14:30 --run-now --fetch-details --max-age 1.0 --append
         """
     )
 
@@ -366,10 +454,24 @@ Examples:
         help='Run immediately when starting scheduler (only used with --schedule)'
     )
 
+    parser.add_argument(
+        '--max-age',
+        type=float,
+        default=None,
+        help='Only include listings posted within this many days (e.g., 1.0 for daily scrapes). Default: no filtering'
+    )
+
+    parser.add_argument(
+        '--append',
+        action='store_true',
+        help='Append to existing CSV file instead of overwriting. Useful for daily scrapes.'
+    )
+
     return parser.parse_args()
 
 
-def run_scrape(url: str, output_file: Path, max_pages: int, delay: float, fetch_details: bool) -> None:
+def run_scrape(url: str, output_file: Path, max_pages: int, delay: float, fetch_details: bool,
+               max_age_days: Optional[float] = None, append: bool = False) -> None:
     """
     Run a single scrape operation
 
@@ -379,6 +481,8 @@ def run_scrape(url: str, output_file: Path, max_pages: int, delay: float, fetch_
         max_pages: Maximum number of pages to scrape
         delay: Delay between requests in seconds
         fetch_details: Whether to fetch detailed info from individual pages
+        max_age_days: Only include listings posted within this many days (None = no filter)
+        append: If True, append to existing file; if False, overwrite
     """
     logger.info("=" * 70)
     logger.info("Starting scrape...")
@@ -386,6 +490,8 @@ def run_scrape(url: str, output_file: Path, max_pages: int, delay: float, fetch_
     logger.info(f"Max pages: {max_pages}")
     logger.info(f"Output file: {output_file}")
     logger.info(f"Fetch details: {fetch_details}")
+    logger.info(f"Max age filter: {max_age_days} days" if max_age_days else "Max age filter: None")
+    logger.info(f"Append mode: {append}")
     logger.info("=" * 70)
 
     # Create scraper
@@ -401,8 +507,15 @@ def run_scrape(url: str, output_file: Path, max_pages: int, delay: float, fetch_
     # Optionally enrich with detailed info
     properties = scraper.enrich_property_details(properties, fetch_details=fetch_details)
 
+    # Filter by recency if requested
+    properties = filter_recent_listings(properties, max_age_days=max_age_days)
+
+    if not properties:
+        logger.warning("No properties match the recency filter")
+        return
+
     # Save to CSV
-    save_to_csv(properties, output_file)
+    save_to_csv(properties, output_file, append=append)
 
     logger.info("Scraping complete!")
     logger.info("=" * 70)
@@ -423,6 +536,8 @@ def run_scheduled(args: argparse.Namespace) -> None:
     logger.info(f"Max pages: {args.max_pages}")
     logger.info(f"Fetch details: {args.fetch_details}")
     logger.info(f"Delay: {args.delay}s")
+    logger.info(f"Max age filter: {args.max_age} days" if args.max_age else "Max age filter: None")
+    logger.info(f"Append mode: {args.append}")
     logger.info("=" * 70)
 
     # Create output directory if specified or use default
@@ -455,7 +570,9 @@ def run_scheduled(args: argparse.Namespace) -> None:
                 output_file=output_file,
                 max_pages=args.max_pages,
                 delay=args.delay,
-                fetch_details=args.fetch_details
+                fetch_details=args.fetch_details,
+                max_age_days=args.max_age,
+                append=args.append
             )
         except Exception as e:
             logger.error(f"Scheduled scrape failed: {e}")
@@ -499,9 +616,10 @@ def main():
             output_file=args.output,
             max_pages=args.max_pages,
             delay=args.delay,
-            fetch_details=args.fetch_details
+            fetch_details=args.fetch_details,
+            max_age_days=args.max_age,
+            append=args.append
         )
-
 
 if __name__ == "__main__":
     main()
