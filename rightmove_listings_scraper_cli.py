@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import pandas as pd
 import requests
 import schedule
 from bs4 import BeautifulSoup
@@ -367,6 +368,51 @@ def save_to_csv(properties: List[Dict], output_file: Path, append: bool = False)
         sys.exit(1)
 
 
+def deduplicate_csv(csv_file: Path) -> None:
+    """
+    Remove duplicate properties from CSV file using pandas, keeping the most recent entry
+
+    Args:
+        csv_file: Path to CSV file to deduplicate
+    """
+    if not csv_file.exists():
+        logger.warning(f"CSV file {csv_file} does not exist, skipping deduplication")
+        return
+
+    logger.info(f"Deduplicating {csv_file}...")
+
+    try:
+        # Read CSV with pandas
+        df = pd.read_csv(csv_file)
+
+        if df.empty:
+            logger.info("No data to deduplicate")
+            return
+
+        original_count = len(df)
+
+        # Check for rows without property_id
+        missing_id = df['property_id'].isna()
+        if missing_id.any():
+            logger.warning(f"Found {missing_id.sum()} row(s) without property_id")
+
+        # Drop duplicates based on property_id, keeping the last occurrence
+        df_deduped = df.drop_duplicates(subset=['property_id'], keep='last')
+
+        duplicates_removed = original_count - len(df_deduped)
+
+        # Write back deduplicated data
+        df_deduped.to_csv(csv_file, index=False)
+
+        if duplicates_removed > 0:
+            logger.info(f"Removed {duplicates_removed} duplicate(s), {len(df_deduped)} unique properties remain")
+        else:
+            logger.info("No duplicates found")
+
+    except Exception as e:
+        logger.error(f"Error during deduplication: {e}")
+
+
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
@@ -517,6 +563,9 @@ def run_scrape(url: str, output_file: Path, max_pages: int, delay: float, fetch_
     # Save to CSV
     save_to_csv(properties, output_file, append=append)
 
+    # Deduplicate the CSV file (removes duplicates based on property_id)
+    deduplicate_csv(output_file)
+
     logger.info("Scraping complete!")
     logger.info("=" * 70)
 
@@ -620,6 +669,7 @@ def main():
             max_age_days=args.max_age,
             append=args.append
         )
+
 
 if __name__ == "__main__":
     main()
